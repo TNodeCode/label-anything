@@ -1,0 +1,7 @@
+globox
+numpy
+pandas
+Pillow
+streamlit
+supervision
+ultralytics
