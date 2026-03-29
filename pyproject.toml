@@ -1,0 +1,18 @@
+[project]
+name = "label-anything"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "clip",
+    "streamlit>=1.55.0",
+    "supervision>=0.27.0.post2",
+    "timm>=1.0.26",
+    "transformers>=5.4.0",
+    "ultralytics>=8.4.30",
+]
+
+
+[tool.uv.sources]
+clip = { git = "https://github.com/ultralytics/CLIP.git" }
