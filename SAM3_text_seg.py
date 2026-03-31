@@ -1,5 +1,4 @@
 import os
-import glob
 import json
 from typing import List
 
@@ -40,10 +39,8 @@ def masks_nms(masks: np.ndarray, scores: np.ndarray, iou_threshold: float) -> Li
 @st.cache_resource
 def load_sam3(
     model_path: str = "sam3.pt",
-    conf: float = 0.25,
 ):
     overrides = dict(
-        conf=conf,
         task="segment",
         mode="predict",
         model=model_path,
@@ -101,10 +98,8 @@ st.markdown(
 )
 
 prompts_input = st.text_input("Text prompts (comma separated)", "a person, a dog")
-image_dir = st.text_input("Path to image directory")
+uploaded_image = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 model_path = st.text_input("SAM3 model path", "sam3.pt")
-conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.25)
-nms_iou = st.slider("NMS IoU threshold", 0.0, 1.0, 0.5)
 model_choice = st.selectbox("Model", ("SAM3", "YOLO-World", "YOLO-Seg"))
 run_button = st.button("Run")
 
@@ -118,160 +113,153 @@ if run_button:
     prompts = [p.strip() for p in prompts_input.split(",") if p.strip()]
     if not prompts:
         st.error("Provide at least one text prompt.")
-    elif not image_dir or not os.path.isdir(os.path.expanduser(image_dir)):
-        st.error("Provide a valid image directory path.")
+    elif uploaded_image is None:
+        st.error("Please upload an image.")
     else:
-        images_glob = []
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-            images_glob.extend(
-                glob.glob(os.path.join(os.path.expanduser(image_dir), ext))
-            )
-        images_glob = sorted(images_glob)
-        n_images = len(images_glob)
-        if n_images == 0:
-            st.warning("No images found in the directory.")
+        # Save uploaded image temporarily
+        img = Image.open(uploaded_image)
+        image_path = "temp_uploaded_image.png"
+        img.save(image_path)
+        
+        images_meta = []
+        annotations = []
+        categories = [{"id": idx, "name": name} for idx, name in enumerate(prompts)]
+
+        progress = st.progress(0)
+        image_counter = 1
+        ann_counter = 1
+
+        # Prepare model(s)
+        if model_choice == "SAM3":
+            predictor = load_sam3(model_path)
+        elif model_choice == "YOLO-World":
+            yolo = load_yolo_world("yolov8x-worldv2.pt")
+            try:
+                yolo.set_classes(prompts)
+            except Exception:
+                pass
         else:
-            out_dir = os.path.expanduser(f"{image_dir}-sam3")
-            os.makedirs(out_dir, exist_ok=True)
+            yolo = YOLO("yoloe-26x-seg.pt")
+            try:
+                yolo.set_classes(prompts)
+            except Exception:
+                pass
 
-            images_meta = []
-            annotations = []
-            categories = [{"id": idx, "name": name} for idx, name in enumerate(prompts)]
+        progress.progress(100)
+        print("LOADED IMAGE SHAPE", image_path, img.size)
+        w, h = img.size
+        images_meta.append(
+            {
+                "id": image_counter,
+                "file_name": os.path.basename(image_path),
+                "width": w,
+                "height": h,
+            }
+        )
 
-            progress = st.progress(0)
-            image_counter = 1
-            ann_counter = 1
+        # collect all masks/scores/classes for this image first
+        all_xyxy: List[List[float]] = []
+        all_masks: List[np.ndarray] = []
+        all_scores: List[float] = []
+        all_cls: List[int] = []
 
-            # Prepare model(s)
-            if model_choice == "SAM3":
-                predictor = load_sam3(model_path, conf_threshold)
-            elif model_choice == "YOLO-World":
-                yolo = load_yolo_world("yolov8x-worldv2.pt")
+        if model_choice == "SAM3":
+            predictor.set_image(image_path)
+            for pid, prompt in enumerate(prompts):
                 try:
-                    yolo.set_classes(prompts)
-                except Exception:
-                    pass
-            else:
-                yolo = YOLO("yoloe-26x-seg.pt")
-                try:
-                    yolo.set_classes(prompts)
-                except Exception:
-                    pass
-
-            for i, image_path in enumerate(images_glob):
-                progress.progress(int((i + 1) / n_images * 100) / 100)
-                img = Image.open(image_path).convert("RGB")
-                print("LOADED IMAGE SHAPE", image_path, img.size)
-                w, h = img.size
-                images_meta.append(
-                    {
-                        "id": image_counter,
-                        "file_name": os.path.basename(image_path),
-                        "width": w,
-                        "height": h,
-                    }
-                )
-
-                # collect all masks/scores/classes for this image first
-                all_xyxy: List[List[float]] = []
-                all_masks: List[np.ndarray] = []
-                all_scores: List[float] = []
-                all_cls: List[int] = []
-
-                if model_choice == "SAM3":
-                    predictor.set_image(image_path)
-                    for pid, prompt in enumerate(prompts):
-                        try:
-                            results = predictor(text=[prompt])
-                        except Exception as e:
-                            st.warning(f"Predictor failed for prompt '{prompt}': {e}")
-                            continue
-
-                        if not results:
-                            continue
-
-                        res = results[0]
-                        if not len(res.boxes.data):
-                            continue
-                        all_xyxy.extend(res.boxes.xyxy.cpu().numpy().tolist())
-                        all_masks.extend(res.masks.data.cpu().numpy())
-                        all_scores.extend(res.boxes.conf.cpu().numpy())
-                        all_cls.extend([pid] * len(res.masks.data))
-                else:
-                    try:
-                        results = yolo.predict(image_path)  #
-
-                    except Exception as e:
-                        st.warning(
-                            f"YOLO prediction failed for image '{image_path}': {e}"
-                        )
-                        results = []
-
-                    if results:
-                        res = results[0]
-                        # boxes
-                        try:
-                            if hasattr(res, "boxes") and len(res.boxes.data):
-                                all_xyxy.extend(res.boxes.xyxy.cpu().numpy().tolist())
-                                all_scores.extend(res.boxes.conf.cpu().numpy())
-                                try:
-                                    cls_arr = (
-                                        res.boxes.cls.cpu().numpy().astype(int).tolist()
-                                    )
-                                except Exception:
-                                    cls_arr = [0] * len(res.boxes.conf)
-                                all_cls.extend(cls_arr)
-                        except Exception:
-                            pass
-
-                        # masks (if model produces them)
-                        try:
-                            if (
-                                hasattr(res, "masks")
-                                and hasattr(res.masks, "data")
-                                and len(res.masks.data)
-                            ):
-                                # res.masks.data likely shape (N, H, W)
-                                all_masks.extend(
-                                    res.masks.data.cpu().numpy().astype(bool)
-                                )
-                        except Exception:
-                            pass
-
-                if len(all_xyxy) == 0:
-                    # nothing detected for this image
-                    input_image_view.image(img)
-                    image_counter += 1
+                    results = predictor(text=[prompt])
+                except Exception as e:
+                    st.warning(f"Predictor failed for prompt '{prompt}': {e}")
                     continue
-                elif len(all_masks) == 0:
-                    detections = sv.Detections(
-                        xyxy=np.array(all_xyxy),
-                        class_id=np.array(all_cls),
-                    )
-                    annotator = sv.BoxAnnotator()
-                    annotated_image = annotator.annotate(
-                        scene=img.copy(),
-                        detections=detections,
-                    )
-                    input_image_view.image(annotated_image)
-                    image_counter += 1
-                else:
-                    print("IMAGE SHAPE", img.size)
-                    print("MASK SHAPE", all_masks[0].shape)
-                    w, h = all_masks[0].shape[1], all_masks[0].shape[0]
-                    detections = sv.Detections(
-                        xyxy=np.array(all_xyxy),
-                        mask=np.array(all_masks),
-                        class_id=np.array(all_cls),
-                    )
 
-                    # show images with masks
-                    annotator = sv.MaskAnnotator(
-                        opacity=0.5,
-                    )
-                    annotated_image = annotator.annotate(
-                        scene=img.copy().resize((w, h)),
-                        detections=detections,
-                    )
-                    input_image_view.image(annotated_image)
-                    image_counter += 1
+                if not results:
+                    continue
+
+                res = results[0]
+                if not len(res.boxes.data):
+                    continue
+                all_xyxy.extend(res.boxes.xyxy.cpu().numpy().tolist())
+                all_masks.extend(res.masks.data.cpu().numpy())
+                all_scores.extend(res.boxes.conf.cpu().numpy())
+                all_cls.extend([pid] * len(res.masks.data))
+        else:
+            try:
+                results = yolo.predict(image_path)
+
+            except Exception as e:
+                st.warning(
+                    f"YOLO prediction failed for image '{image_path}': {e}"
+                )
+                results = []
+
+            if results:
+                res = results[0]
+                # boxes
+                try:
+                    if hasattr(res, "boxes") and len(res.boxes.data):
+                        all_xyxy.extend(res.boxes.xyxy.cpu().numpy().tolist())
+                        all_scores.extend(res.boxes.conf.cpu().numpy())
+                        try:
+                            cls_arr = (
+                                res.boxes.cls.cpu().numpy().astype(int).tolist()
+                            )
+                        except Exception:
+                            cls_arr = [0] * len(res.boxes.conf)
+                        all_cls.extend(cls_arr)
+                except Exception:
+                    pass
+
+                # masks (if model produces them)
+                try:
+                    if (
+                        hasattr(res, "masks")
+                        and hasattr(res.masks, "data")
+                        and len(res.masks.data)
+                    ):
+                        # res.masks.data likely shape (N, H, W)
+                        all_masks.extend(
+                            res.masks.data.cpu().numpy().astype(bool)
+                        )
+                except Exception:
+                    pass
+
+        if len(all_xyxy) == 0:
+            # nothing detected for this image
+            input_image_view.image(img)
+            image_counter += 1
+        elif len(all_masks) == 0:
+            detections = sv.Detections(
+                xyxy=np.array(all_xyxy),
+                class_id=np.array(all_cls),
+            )
+            annotator = sv.BoxAnnotator()
+            annotated_image = annotator.annotate(
+                scene=img.copy(),
+                detections=detections,
+            )
+            input_image_view.image(annotated_image)
+            image_counter += 1
+        else:
+            print("IMAGE SHAPE", img.size)
+            print("MASK SHAPE", all_masks[0].shape)
+            w, h = all_masks[0].shape[1], all_masks[0].shape[0]
+            detections = sv.Detections(
+                xyxy=np.array(all_xyxy),
+                mask=np.array(all_masks),
+                class_id=np.array(all_cls),
+            )
+
+            # show images with masks
+            annotator = sv.MaskAnnotator(
+                opacity=0.5,
+            )
+            annotated_image = annotator.annotate(
+                scene=img.copy().resize((w, h)),
+                detections=detections,
+            )
+            input_image_view.image(annotated_image)
+            image_counter += 1
+
+        # Clean up temporary file
+        if os.path.exists(image_path):
+            os.remove(image_path)
